@@ -6,10 +6,10 @@ import { Buffer } from "node:buffer";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { timingSafeEqual, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { getWrapperPort } from "./env.js";
+import { getWrapperPort, getRuntimePath } from "./env.js";
 import { getOrCreateKeypair } from "./pop-keys.js";
 
 const execAsync = promisify(exec);
@@ -307,11 +307,45 @@ function findExpectedTokens(accounts) {
   return tokens;
 }
 
+function writeRuntimeFile({ port, startedAt, log, warn }) {
+  // iOS uses this file to discover the actual wrapper port, so it doesn't
+  // have to assume the gatewayPort+1 convention (which collides with stale
+  // openclaw-plugins processes from prior gateway runs).
+  try {
+    const runtimePath = getRuntimePath();
+    mkdirSync(path.dirname(runtimePath), { recursive: true });
+    writeFileSync(
+      runtimePath,
+      JSON.stringify({ port, pid: process.pid, startedAt, pluginVersion: _packageVersion }) + "\n",
+      { mode: 0o600 },
+    );
+    log(`runtime info written to ${runtimePath}`);
+  } catch (err) {
+    warn(`runtime.json write failed`, err);
+  }
+}
+
+function clearRuntimeFile() {
+  // Best-effort cleanup on graceful exit so iOS doesn't read a stale port
+  // from a previous run. SIGKILL bypasses this; the runtime check happens
+  // every time iOS reads, so a stale file is no worse than the legacy
+  // gatewayPort+1 assumption it replaces.
+  try { unlinkSync(getRuntimePath()); } catch { /* ignore */ }
+}
+
 export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, warn }) {
   // Env reads are isolated in env.js (scanner-safe — that file has no
   // outbound capability). Mixing environment access with `fetch` in this
   // file trips the install-time "credential harvesting" pattern check.
-  const port = getWrapperPort(gatewayPort + 1);
+  //
+  // Bind strategy: prefer `gatewayPort + 1` (legacy contract: pre-v0.13
+  // iOS still computes the wrapper port that way). On EADDRINUSE — most
+  // commonly a stale openclaw-plugins from a prior gateway run — fall
+  // back to `0` (kernel-assigned free port). The actual port is always
+  // written to `~/.openclaw-<profile>/onepilot-runtime.json` so v0.13+
+  // iOS clients can discover it without assuming +1.
+  // `ONEPILOT_WRAPPER_PORT` env var still wins (explicit ops override).
+  const preferredPort = getWrapperPort(gatewayPort + 1);
   const startedAt = new Date().toISOString();
   let cachedTokens = findExpectedTokens(initialAccounts);
 
@@ -334,7 +368,7 @@ export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, w
 
   const server = http.createServer(async (req, res) => {
     try {
-      const url = new URL(req.url, `http://127.0.0.1:${port}`);
+      const url = new URL(req.url, `http://127.0.0.1`);
       const auth = req.headers["authorization"] || "";
       const presented = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
 
@@ -367,10 +401,40 @@ export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, w
     }
   });
 
-  server.on("error", (err) => warn(`wrapper server error`, err));
-  server.listen(port, "127.0.0.1", () => {
-    log(`wrapper API listening on 127.0.0.1:${port} (v${_packageVersion})`);
+  // EADDRINUSE handler: when a stale openclaw-plugins from a prior gateway
+  // holds gatewayPort+1, retry once with port 0 (kernel-assigned). Without
+  // this fallback the v0.12 plugin silently bound nothing — iOS got
+  // connection-refused and the agent was unreachable until manual cleanup.
+  let fallbackUsed = false;
+  function onListenError(err) {
+    if (err && err.code === "EADDRINUSE" && !fallbackUsed) {
+      fallbackUsed = true;
+      warn(`wrapper port ${preferredPort} in use (likely stale openclaw-plugins) — retrying on kernel-assigned port`, err);
+      try { server.close(); } catch { /* noop */ }
+      // Detach the listening one-shot so the retry's listen() callback fires.
+      server.removeListener("error", onListenError);
+      server.on("error", (e) => warn(`wrapper server error`, e));
+      server.listen(0, "127.0.0.1", () => {
+        const actualPort = server.address()?.port ?? 0;
+        log(`wrapper API listening on 127.0.0.1:${actualPort} (v${_packageVersion}, fallback)`);
+        writeRuntimeFile({ port: actualPort, startedAt, log, warn });
+      });
+      return;
+    }
+    warn(`wrapper server error`, err);
+  }
+  server.once("error", onListenError);
+  server.listen(preferredPort, "127.0.0.1", () => {
+    const actualPort = server.address()?.port ?? preferredPort;
+    log(`wrapper API listening on 127.0.0.1:${actualPort} (v${_packageVersion})`);
+    writeRuntimeFile({ port: actualPort, startedAt, log, warn });
   });
+
+  // Clean up runtime.json on graceful shutdown. Don't crash if the gateway
+  // already removed it.
+  process.once("SIGINT", () => { clearRuntimeFile(); process.exit(130); });
+  process.once("SIGTERM", () => { clearRuntimeFile(); process.exit(143); });
+  process.once("exit", clearRuntimeFile);
 
   const refreshTimer = setInterval(refreshTokens, 60_000);
   refreshTimer.unref?.();
