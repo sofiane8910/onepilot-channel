@@ -333,19 +333,16 @@ function clearRuntimeFile() {
   try { unlinkSync(getRuntimePath()); } catch { /* ignore */ }
 }
 
-export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, warn }) {
+export function startWrapperApi({ accounts: initialAccounts, log, warn }) {
   // Env reads are isolated in env.js (scanner-safe — that file has no
   // outbound capability). Mixing environment access with `fetch` in this
   // file trips the install-time "credential harvesting" pattern check.
   //
-  // Bind strategy: prefer `gatewayPort + 1` (legacy contract: pre-v0.13
-  // iOS still computes the wrapper port that way). On EADDRINUSE — most
-  // commonly a stale openclaw-plugins from a prior gateway run — fall
-  // back to `0` (kernel-assigned free port). The actual port is always
-  // written to `~/.openclaw-<profile>/onepilot-runtime.json` so v0.13+
-  // iOS clients can discover it without assuming +1.
-  // `ONEPILOT_WRAPPER_PORT` env var still wins (explicit ops override).
-  const preferredPort = getWrapperPort(gatewayPort + 1);
+  // Bind: kernel-assigned free port (0). The actual port is written to
+  // `~/.openclaw-<profile>/onepilot-runtime.json`; iOS reads that file
+  // to discover the port. `ONEPILOT_WRAPPER_PORT` is an explicit ops
+  // override for debugging.
+  const requestedPort = getWrapperPort(0);
   const startedAt = new Date().toISOString();
   let cachedTokens = findExpectedTokens(initialAccounts);
 
@@ -401,31 +398,9 @@ export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, w
     }
   });
 
-  // EADDRINUSE handler: when a stale openclaw-plugins from a prior gateway
-  // holds gatewayPort+1, retry once with port 0 (kernel-assigned). Without
-  // this fallback the v0.12 plugin silently bound nothing — iOS got
-  // connection-refused and the agent was unreachable until manual cleanup.
-  let fallbackUsed = false;
-  function onListenError(err) {
-    if (err && err.code === "EADDRINUSE" && !fallbackUsed) {
-      fallbackUsed = true;
-      warn(`wrapper port ${preferredPort} in use (likely stale openclaw-plugins) — retrying on kernel-assigned port`, err);
-      try { server.close(); } catch { /* noop */ }
-      // Detach the listening one-shot so the retry's listen() callback fires.
-      server.removeListener("error", onListenError);
-      server.on("error", (e) => warn(`wrapper server error`, e));
-      server.listen(0, "127.0.0.1", () => {
-        const actualPort = server.address()?.port ?? 0;
-        log(`wrapper API listening on 127.0.0.1:${actualPort} (v${_packageVersion}, fallback)`);
-        writeRuntimeFile({ port: actualPort, startedAt, log, warn });
-      });
-      return;
-    }
-    warn(`wrapper server error`, err);
-  }
-  server.once("error", onListenError);
-  server.listen(preferredPort, "127.0.0.1", () => {
-    const actualPort = server.address()?.port ?? preferredPort;
+  server.on("error", (err) => warn(`wrapper server error`, err));
+  server.listen(requestedPort, "127.0.0.1", () => {
+    const actualPort = server.address()?.port ?? requestedPort;
     log(`wrapper API listening on 127.0.0.1:${actualPort} (v${_packageVersion})`);
     writeRuntimeFile({ port: actualPort, startedAt, log, warn });
   });

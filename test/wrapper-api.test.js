@@ -80,7 +80,6 @@ async function bootWrapper({ port, runtimeFile } = {}) {
   const rt = runtimeFile ?? path.join(mkdtempSync(path.join(tmpdir(), "onepilot-rt-")), "runtime.json");
   process.env.ONEPILOT_RUNTIME_FILE = rt;
   const server = startWrapperApi({
-    gatewayPort: 18789,
     accounts: { default: { wrapperApiToken: WRAPPER_TOKEN } },
     log: (m) => calls.logs.push(m),
     warn: (m, e) => calls.warns.push([m, e?.message || String(e || "")]),
@@ -219,48 +218,31 @@ test("wrapper API: writes runtime.json with chosen port + pid + version", async 
   }
 });
 
-test("wrapper API: EADDRINUSE on preferred port falls back to kernel-assigned port", async () => {
-  // Regression for the May 2026 outage: a stale openclaw-plugins process
-  // held gatewayPort+1; the v0.12 wrapper logged an error and bound nothing.
-  // v0.13 must detect EADDRINUSE and fall back to a free port, with the
-  // actual port reflected in runtime.json so iOS can discover it.
+test("wrapper API: defaults to kernel-assigned port (no collision possible)", async () => {
+  // The May 2026 outage was a stale openclaw-plugins holding gatewayPort+1.
+  // v0.13 binds port 0 unconditionally so there's no port to collide on.
+  // iOS reads the actual port from runtime.json.
   const { binDir } = setupStubBin();
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
-
-  // Hold a high port to simulate the orphan.
-  const http = await import("node:http");
-  const blocker = http.createServer(() => {});
-  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
-  const blockedPort = blocker.address().port;
-
   const oldExplicit = process.env.ONEPILOT_WRAPPER_PORT;
-  // Force the wrapper to *prefer* the blocked port — without env override,
-  // it would prefer 18790 which we don't want to depend on being free.
-  process.env.ONEPILOT_WRAPPER_PORT = String(blockedPort);
+  delete process.env.ONEPILOT_WRAPPER_PORT;
 
   let server;
   try {
     const r = await bootWrapper({ port: undefined });
     server = r.server;
-    // The wrapper's listen(blockedPort) fails → it close()s and re-listens
-    // on port 0. Wait extra for the retry to settle.
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
     const { existsSync, readFileSync } = await import("node:fs");
-    assert.ok(existsSync(r.runtimeFile), "runtime.json should be written after fallback");
+    assert.ok(existsSync(r.runtimeFile), "runtime.json should be written");
     const parsed = JSON.parse(readFileSync(r.runtimeFile, "utf8"));
-    assert.notEqual(parsed.port, blockedPort, "should have fallen back from the blocked port");
-    assert.ok(parsed.port > 0 && parsed.port < 65536, "fallback port should be a real port");
-
-    // Wrapper is healthy on the new port.
+    assert.ok(parsed.port > 0 && parsed.port < 65536, "kernel should assign a real port");
+    // Wrapper is healthy on the assigned port.
     const probe = await fetch(`http://127.0.0.1:${parsed.port}/onepilot/v1/health`, {
       headers: { authorization: `Bearer ${WRAPPER_TOKEN}` },
     });
-    assert.equal(probe.status, 200, "wrapper should respond on the fallback port");
+    assert.equal(probe.status, 200);
   } finally {
     if (server) server.close();
-    blocker.close();
     if (oldExplicit !== undefined) {
       process.env.ONEPILOT_WRAPPER_PORT = oldExplicit;
     } else {

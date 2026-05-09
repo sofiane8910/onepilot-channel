@@ -174,7 +174,7 @@ export default definePluginEntry({
 
     if (!_wrapperApiStarted) {
       try {
-        startWrapperApi({ gatewayPort, accounts, log, warn });
+        startWrapperApi({ accounts, log, warn });
         _wrapperApiStarted = true;
       } catch (err) {
         warn("startWrapperApi failed — iOS configure-key + approvals toggle will be unreachable", err);
