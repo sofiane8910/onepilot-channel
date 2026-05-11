@@ -4,6 +4,7 @@
 
 import path from "node:path";
 import os from "node:os";
+import { readFileSync } from "node:fs";
 
 export function getAgentId() {
   const raw = process.env.OPENCLAW_PROFILE;
@@ -13,6 +14,25 @@ export function getAgentId() {
 export function getWrapperPort(fallback) {
   const raw = Number(process.env.ONEPILOT_WRAPPER_PORT);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+// True if we're running inside an actual `openclaw gateway run` host;
+// false if a CLI command (`openclaw plugins info`, `--link` install) loaded
+// the plugin module to inspect it. Used to skip starting long-lived servers
+// in CLI mode — those keep the event loop alive forever and wedge the CLI.
+//
+// Detection: the plugin runs inside an `openclaw-plugins` worker; its
+// parent process is `openclaw-gateway` in gateway mode and the bare
+// `openclaw` CLI in inspection mode. /proc is Linux-only — on macOS we
+// default to true (the wedge bug only happens on remote Linux hosts the
+// app SSHes into, never on a Mac dev machine).
+export function isGatewayMode() {
+  try {
+    const comm = readFileSync(`/proc/${process.ppid}/comm`, "utf8").trim();
+    return comm === "openclaw-gateway";
+  } catch {
+    return true;
+  }
 }
 
 // Path the plugin writes its runtime info to (chosen port, pid, version).

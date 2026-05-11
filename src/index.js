@@ -10,6 +10,7 @@ import { createUpstreamApprovalsBridge } from "./approvals-gate-upstream.js";
 import { buildToolResultPersistHook } from "./approvals-context.js";
 import { signAuthHeader } from "./pop-keys.js";
 import { startWrapperApi } from "./wrapper-api.js";
+import { isGatewayMode } from "./env.js";
 
 // One subscription / channel registration per process — register() can fire
 // multiple times and we need to dedupe to avoid duplicate inserts.
@@ -170,6 +171,15 @@ export default definePluginEntry({
       }
     } else {
       warn("api.on unavailable — OpenClaw too old? approval gate inert");
+    }
+
+    // Long-lived servers (wrapper API HTTP + stream subscription) keep the
+    // event loop alive. When `openclaw plugins info / install --link` loads
+    // the plugin module just to inspect it, starting them wedges the CLI
+    // forever — caller never gets control back. Gate on real gateway mode.
+    if (!isGatewayMode()) {
+      log("plugin loaded outside gateway (likely CLI inspection); skipping wrapper API + subscriptions");
+      return;
     }
 
     if (!_wrapperApiStarted) {
